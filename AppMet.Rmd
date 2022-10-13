@@ -4,7 +4,33 @@ author: "Jonathan Ferreira & Elisa Lannelongue"
 output: html_document
 ---
 
-```{r}
 
+```{r, include=FALSE}
+library(tidyverse)
+library(shiny)
+library(readxl)
+```
+
+## Introduction
+
+
+## Dataset : Met Opera
+
+```{r, warning=FALSE}
+rawdata <- read_xlsx(path = 'data.xlsx')
+#Column names
+names(rawdata)
+#Raw first 6 columns
+head(rawdata)[,1:6]
+```
+
+
+```{r}
+#Possible Add :
+#REV_BODY / REV_BY 
+data <- rawdata %>%
+  select('TI_COMP', 'TI_TINAME', 'SEASON', 'PDATE', 'LANG', 'LOC_NAME', 'MEDIA_IMAGE', 'PERF_NAME', 'PERF_ROLE', 'PTYPE')
+
+head(data)
 ```
 
