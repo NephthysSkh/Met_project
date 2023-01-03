@@ -4,33 +4,365 @@ author: "Jonathan Ferreira & Elisa Lannelongue"
 output: html_document
 ---
 
+Les librairies dont nous aurons besoin :
 
 ```{r, include=FALSE}
 library(tidyverse)
 library(shiny)
 library(readxl)
+library(rvest)
+library(lubridate)
+library(magick)
+library(ggpubr)
+library(gridExtra)
 ```
 
-## Introduction
-
-
-## Dataset : Met Opera
+Chargement du dataset original
 
 ```{r, warning=FALSE}
 rawdata <- read_xlsx(path = 'data.xlsx')
-#Column names
-names(rawdata)
-#Raw first 6 columns
-head(rawdata)[,1:6]
 ```
-
+Selection des colonnes d'intérêts
+par exemple: compositeur, titre de l'opéra, date, chanteurs ...
 
 ```{r}
-#Possible Add :
-#REV_BODY / REV_BY 
 data <- rawdata %>%
-  select('TI_COMP', 'TI_TINAME', 'SEASON', 'PDATE', 'LANG', 'LOC_NAME', 'MEDIA_IMAGE', 'PERF_NAME', 'PERF_ROLE', 'PTYPE')
+  select('DOCKEY', 'TI_COMP', 'TI_TINAME', 'SEASON', 'PDATE', 'LANG', 'LOC_NAME', 'MEDIA_IMAGE', 'PERF_NAME', 'PERF_ROLE', 'PTYPE')
+```
 
-head(data)
+Rangement du dataset
+
+```{r}
+data <- data %>%
+  #suppression des lignes dont on ne connait pas le compositeur ou l'opéra
+  filter(!is.na(TI_COMP) & !is.na(TI_TINAME)) %>%
+  #suppression de lignes où il pourrait y avoir une erreur dans le nom du compositeur ou de l'opéra
+  filter(nchar(TI_COMP) > 3 & nchar(TI_TINAME) > 3) %>%
+  #selection pour ne garder que des opéras, et non des concerts
+  filter(PTYPE == 'Met Performance') %>%
+  #une suite de conversion pour faciliter le traitement des données (accents, caractère spéciaux ...)
+  mutate(TI_COMPASCII = iconv(TI_COMP, to = 'ASCII//TRANSLIT')) %>%
+  mutate(TI_TINAMEASCII = iconv(TI_TINAME, to = 'ASCII//TRANSLIT')) %>%
+  mutate(TI_COMPregex = str_replace_all(TI_COMPASCII, regex("//W+"), "")) %>%
+  mutate(TI_TINAMEregex = str_replace_all(TI_TINAMEASCII, regex("//W+"), "")) %>%
+  mutate(TI_COMPend = word(TI_COMPregex, -1)) %>%
+  mutate(TI_TINAMEend = str_replace_all(TI_TINAMEregex, " ", "+")) %>%
+  filter(!grepl("\\|", TI_COMPend)) %>%
+  filter(!grepl("\\|", TI_TINAMEend)) %>% 
+  #formatage des dates
+  mutate(PDATE = ymd(PDATE)) %>% 
+  #suppression des lignes où on ne connait pas la date de représentation
+  filter(!is.na(PDATE))
+```
+
+La langue des représentations n'est indiqué que si la réprésentation n'était pas dans la langue originale de l'opéra
+On a donc scrap autant de langues manquantes que possibles des opéras présents dans la base de données.
+On ajoute ainsi la langue de 20802 lignes où elle était manquante.
+
+```{r}
+#On filtre les données où la langue est manquante
+datalangna <- data %>%
+  filter(is.na(LANG))
+
+#on stocke les noms des compositeur et les titre des Opéra dans un dataframe (en un seul exemplaire)
+dataforrvest <- unique(datalangna[, c("TI_COMPend","TI_TINAMEend")])
+
+n <- nrow(dataforrvest)
+
+#On se sert du dataframe unique précédent pour scrap le nom des opéras dont on n'a pas la langue originale
+for (i in 1:n){
+  url <- paste("https://www.opera-arias.com/search/&q=", dataforrvest$TI_COMPend[i], "+", dataforrvest$TI_TINAMEend[i], "+", sep = "")
+  html <- read_html(url)
+  language <- html %>%
+    html_element('#row_1 .s_lang') %>%
+    html_text2()
+  dataforrvest$LANG[i] <- word(language, -1)
+}
+```
+
+On associe à chaque Opéra où il manque la langue, sa langue originale précédement récupérée sur internet
+
+```{r}
+n <- nrow(datalangna)
+
+for (i in 1:n) {
+  datalangna$LANG[i] <- as.character(dataforrvest[datalangna$TI_COMPend[i] == dataforrvest$TI_COMPend & datalangna$TI_TINAMEend[i] == dataforrvest$TI_TINAMEend, 'LANG'])
+}
+```
+
+On réassocie les dataframe de langue manquante et le dataframe originale en fonction de la clé des entrées de données.
+
+```{r}
+data$LANG[match(datalangna$DOCKEY,data$DOCKEY)] <- datalangna$LANG
+```
+
+On scrap une base de donnees des langues du monde (remise en page de données tirées du site de la CIA)
+
+```{r}
+html <- read_html("https://www.infoplease.com/countries/languages-spoken-in-each-country-of-the-world")
+
+datalang <- html %>%
+  html_node("table") %>%
+  html_table()
+
+names(datalang) = c('country','languages')
+```
+
+On vérifie grâce à notre base de données de langue, qu'il n'y ai pas d'erreur d'entrées dans les langues de la base de données d'opéra
+
+```{r}
+testlangfun <- function(data){
+  a <- c()
+  for (i in data){
+    a <- c(a,(sum(grepl(i, datalang$languages)) > 0))
+  }
+  return(a)
+}
+```
+
+On filtre notre base de données pour ne garder que les lignes où la langue est présente, pour faciliter le traitement dans une future fonction
+
+```{r}
+dataforhist <- data %>% 
+  drop_na(LANG) %>% 
+  filter(testlangfun(LANG))
+```
+
+Pour les graphiques suivants, nbr = 1 représentera la recherche d'un compositeur
+                              nbr = 2 la recherche d'un chanteur
+                              nbr = 3 la recherche d'un opéra
+
+On créer une fonction qui fera un histogramme du nombre de représentation par langue des opéras, appliquable à un compositeur, ou à un chanteur, d'une date à une autre (Saison)
+
+```{r}
+histcompfun <- function(nbr = "", compositor = "", singer = "", data = dataforhist, vartime = c(1883, 2018)){
+  #traitements des erreurs de frappes potentiels, non possible dans l'application shiny, car autofill des noms obligatoire
+  if ((nbr == 1) & (sum(grepl(compositor, data$TI_COMP)) == 0)){
+    return("Compositeur non-présent dans la base de données")
+  }
+  if ((nbr == 2) & (sum(grepl(singer, data$PERF_NAME)) == 0)){
+    return("Chanteur non-présent dans la base de données")
+  }
+  if (nbr == 3){
+    return("Pas d'Histogramme de langue pour les Operas")
+  }
+  
+  #On se limite aux dates données en entrées
+  data <- data %>% 
+    filter(year(PDATE) >= vartime[1] & year(PDATE) <= vartime[2])
+  
+  #On s'interesse à la variable d'interet i.e. chanteur ou compositeur donc filtrage, puis histogramme avec un count
+  if (nbr == 1){
+    temp <- data %>% 
+      filter(grepl(compositor, TI_COMP))
+  }
+  if (nbr == 2){
+    temp <- data %>% 
+      filter(grepl(singer, PERF_NAME))
+  }
+  if (nbr == 1){
+    histplot <- ggplot(data = temp, mapping = aes(x = LANG, fill = as.factor(LANG))) +
+    geom_histogram(stat="count") +
+    labs(fill = "Language", x = "", y = "", title = paste0("Repartition of Representation Languages for ", compositor, " from ", vartime[1], " to ", vartime[2]))
+  }
+  if (nbr == 2){
+    histplot <- ggplot(data = temp, mapping = aes(x = LANG, fill = as.factor(LANG))) +
+    geom_histogram(stat="count") +
+    labs(fill = "Language", x = "", y = "", title = paste0("Repartition of Representations Languages for ", singer, " from ", vartime[1], " to ", vartime[2]))
+  }
+  return(histplot)
+}
+```
+
+On créer une fonction qui fera un plot (line + point) du nombre de représentation des opéras, appliquable à un compositeur, ou à un chanteur, d'une date à une autre (Saison)
+
+```{r}
+linecompfun <- function(nbr = "", compositor = "", singer = "", opera = "", data = data, vartime = c(1883,2018)){
+  #traitements des erreurs de frappes potentiels, non possible dans l'application shiny, car autofill des noms obligatoire
+  if ((nbr == 1) & (sum(grepl(compositor, data$TI_COMP)) == 0)){
+    return("Compositeur non-présent dans la base de données")
+  }
+  if ((nbr == 2) & (sum(grepl(singer, data$PERF_NAME)) == 0)){
+    return("Chanteur non-présent dans la base de données")
+  }
+  if ((nbr == 3) & (sum(grepl(opera, data$TI_TINAME)) == 0) & (sum(grepl(compositor, data$TI_COMP)) == 0)){
+    return("Opera non-présent dans la base de données")
+  }
+  
+  #On s'interesse à la variable d'interet i.e. chanteur, compositeur ou opéra donc filtrage
+  if (nbr == 1){
+    temp <- data %>% 
+      filter(grepl(compositor, TI_COMP))
+  }
+  if (nbr == 2){
+    temp <- data %>% 
+      filter(grepl(singer, PERF_NAME))
+  }
+  if (nbr == 3){
+    temp <- data %>% 
+      filter(grepl(compositor, TI_COMP)) %>% 
+      filter(grepl(opera, TI_TINAME))
+  }
+  
+  #Formatage d'un dataset d'interet
+  temp <- temp %>% 
+      #On regroupe par saison
+      group_by(SEASON) %>% 
+      #On applique un count
+      count() %>% 
+      #On simplifiera la lecture de l'année/saison pour le plot
+      mutate(year = as.numeric(substring(SEASON, 1, 4))) %>% 
+      data.frame() %>% 
+      #Un select pour ne garder que les variables d'interets
+      select(year, n) %>% 
+      #On complete les années où il n'y a pas eu de représentations (par de ligne par défault)
+      complete(year = 1883:2018, fill = list(n=0))
+  
+  #plot graphiques limités aux dates d'entrées
+  if(nbr == 1){
+    lineplot <- ggplot(data = temp, aes(x=year, y=n, group=1)) +
+      geom_line(color = 'darkblue') +
+      geom_point(size = .9) +
+      labs(x = "", y = "", title = paste0("Number of Representations per year of ", compositor, " from ", vartime[1], " to ", vartime[2])) +
+      xlim(vartime)
+  }
+  
+  if(nbr == 2){
+    lineplot <- ggplot(data = temp, aes(x=year, y=n, group=1)) +
+      geom_line(color = 'darkblue') +
+      geom_point(size = .9) +
+      labs(x = "", y = "", title = paste0("Number of representations per year of ", singer, " from ", vartime[1], " to ", vartime[2])) +
+      xlim(vartime)
+  }
+  
+  if(nbr == 3){
+    lineplot <- ggplot(data = temp, aes(x=year, y=n, group=1)) +
+      geom_line(color = 'darkblue') +
+      geom_point(size = .9) +
+      labs(x = "", y = "", title = paste0("Number of representations per year of ", compositor, "'s ", opera,  " from ", vartime[1], " to ", vartime[2])) +
+      xlim(vartime)
+  }
+  return(lineplot)
+}
+```
+
+On créer un tableau qui contiendra le nombre de représentation qu'à fait un chanteur dans un opéra, y compris sa première représentation et sa dernière représentation de cet opéra
+
+```{r}
+nbrandfirst <- function(singer = "", data = data){
+  #On compte le nombre de représentation PAR OPERA où le chanteur a été présent
+  nbrrep <- data %>% 
+    filter(grepl(singer, PERF_NAME)) %>% 
+    group_by(TI_TINAME) %>% 
+    count() %>% 
+    arrange(desc(n))
+  
+  #On retrouve la date de sa première représentation dans chaque opéra où il a joué
+  firstrep <- data %>% 
+    filter(grepl(singer, PERF_NAME)) %>% 
+    group_by(TI_TINAME) %>% 
+    slice(which.min(PDATE)) %>% 
+    rename(FIRSTREP = PDATE) %>% 
+    select(TI_TINAME, FIRSTREP)
+  
+  #Et la date de sa dernière représentation dans cet opéra
+  lastrep <- data %>% 
+    filter(grepl(singer, PERF_NAME)) %>% 
+    group_by(TI_TINAME) %>% 
+    slice(which.max(PDATE)) %>% 
+    rename(LASTREP = PDATE)
+  
+  #On regroupe les données
+  nbrrepfirstrep <- merge(nbrrep, firstrep, by = 'TI_TINAME')
+  
+  finaldata <- merge(nbrrepfirstrep, lastrep, by = 'TI_TINAME') %>% 
+    select(TI_COMP, TI_TINAME, n, FIRSTREP, LASTREP)
+  
+  #Formatage du nom des colonnes pour une lecture simplifiée du tableau
+  names(finaldata) <- c('Compositor', 'Opera', 'Number of Representations', 'First Representation', 'Last Representation')
+  
+  return(finaldata)
+}
+```
+
+On décide de créer une fonction qui va scrap l'introduction d'un compositeur/chanteur/opéra sur wikipédia
+
+```{r}
+introfun <- function(compsingoper){
+  #formatage de la variable d'interet
+  temp <- str_replace_all(compsingoper, " ", "_")
+  
+    #attention aux erreurs
+    tryCatch({
+        html <- read_html(paste0("https://en.wikipedia.org/wiki/", temp))
+
+    #On stocke tout le texte d'introduction dans une nouvelle varible
+    fourretout <- html %>%
+    html_element("p:nth-child(4)") %>%
+    html_text2()
+  #le chemin d'une introduction peut changer ... on s'adapte donc à plusieurs cas
+  if (fourretout == "" | is.na(fourretout) | is.null(fourretout)){
+    fourretout <- html %>%
+    html_element("p:nth-child(5)") %>%
+    html_text2()
+  }
+  
+  if (fourretout == "" | is.na(fourretout) | is.null(fourretout)){
+    fourretout <- html %>%
+    html_element("p:nth-child(6)") %>%
+    html_text2()
+  }
+  
+  if (fourretout == "" | is.na(fourretout) | is.null(fourretout)){
+    fourretout <- html %>%
+    html_element("p:nth-child(7)") %>%
+    html_text2()
+  }
+  return(fourretout)
+    }
+      ,
+      error = function(cnd){print(paste0("No Introduction found for ", compsingoper))}
+    )
+}
+```
+
+On créer une base de données filtrée par média (image) qui facilitera l'utilisation d'une future fonction de scrapping
+
+```{r}
+dataforimg <- data %>%
+  filter(!is.na(MEDIA_IMAGE)) %>% 
+  filter(substr(MEDIA_IMAGE, nchar(MEDIA_IMAGE)-3, nchar(MEDIA_IMAGE)) == '.jpg') %>% 
+  filter(!grepl(MEDIA_IMAGE,pattern = "\\|", ))
+```
+
+On créer une fonction qui recupère une ou deux images liés à un opéra selectionné
+
+```{r}
+ggoperaimg <- function(compositor, opera){
+  #filtre de l'opéra d'interet
+  temp <- dataforimg %>% 
+    filter(TI_TINAME == opera) %>% 
+    filter(TI_COMP == compositor)
+  
+  #stockage de l'url présent dans la base de données dans une variable
+  url <- temp$MEDIA_IMAGE[nrow(temp)]
+  #lecture de l'url et stockage dans un plot
+  image <- image_read(url)
+  image <- image_ggplot(image)
+  
+  #si on a accès à plus d'une image:
+  if(nrow(temp) > 1){
+    url <- temp$MEDIA_IMAGE[nrow(temp)-1]
+    image2 <- image_read(url)
+    image2 <- image_ggplot(image2)
+  }
+  
+  #affichage d'une ou deux images en fonction de la disponibilité
+  if(nrow(temp) > 1){
+    grid.arrange(image, image2, nrow = 2)
+    }
+    else(image)
+}
+
 ```
 
